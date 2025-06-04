@@ -1,0 +1,368 @@
+// ===================
+// CONFIGURAÇÕES
+// ===================
+const CONFIG = {
+  SHEET_ID: '1LS8RKbpPt0W32hgpGXuNcvf5ByJAljFBRzDBr9Fx7ag', // ID da sua planilha
+  URL_HF_BRASIL: 'https://www.hfbrasil.org.br/br/estatistica/tomate.aspx',
+  EMAIL_ALERTAS: 'lamarck.melo@somogyicompany.com',
+  ALERTAR_MUDANCA_ESTRUTURAL: false // true só se quiser alertas de mudança estrutural
+};
+
+// ===================
+// FUNÇÃO PRINCIPAL
+// ===================
+function crawlerHFBrasil() {
+  try {
+    console.log('Iniciando crawler HF Brasil...');
+    verificarEstruturaSite(); // Só alerta se houver mudança relevante
+    const dados = buscarDadosHFBrasil();
+    if (!dados || dados.length === 0) return;
+    salvarNaPlanilha(dados);
+    enviarRelatorio(dados);
+    console.log(`✅ Crawler concluído! ${dados.length} registros processados.`);
+  } catch (error) {
+    console.error('❌ Erro no crawler:', error);
+    GmailApp.sendEmail(CONFIG.EMAIL_ALERTAS, 'ERRO NO CRAWLER', error.message);
+  }
+}
+
+// ===================
+// EXTRAÇÃO DE DADOS
+// ===================
+function buscarDadosHFBrasil() {
+  try {
+    const response = UrlFetchApp.fetch(CONFIG.URL_HF_BRASIL);
+    const html = response.getContentText();
+    return extrairDadosHFBrasil(html);
+  } catch (error) {
+    console.error('Erro na busca de dados:', error);
+    enviarAlertaErro(`Falha na coleta: ${error.message}`);
+    return null;
+  }
+}
+
+function extrairDadosHFBrasil(html) {
+  const dados = [];
+  const tabelas = html.match(/<table[\s\S]*?<\/table>/gi) || [];
+  const tabelaHtml = tabelas[0];
+
+  const normalizarData = (dataStr) => {
+    const meses = {
+      'jan': '01', 'fev': '02', 'mar': '03', 'abr': '04',
+      'mai': '05', 'jun': '06', 'jul': '07', 'ago': '08',
+      'set': '09', 'out': '10', 'nov': '11', 'dez': '12'
+    };
+    const [dia, mesAbreviado] = dataStr.split('/');
+    return `${dia.padStart(2, '0')}/${meses[mesAbreviado?.toLowerCase()] || '00'}/${new Date().getFullYear()}`;
+  };
+
+  if (!tabelaHtml) {
+    console.log('❌ Tabela não encontrada');
+    return dados;
+  }
+
+  const linhas = tabelaHtml.match(/<tr[^>]*>([\s\S]*?)<\/tr>/gi) || [];
+  if (linhas.length < 2) {
+    console.log('⚠️ Tabela sem linhas de dados');
+    return dados;
+  }
+
+  // Extrai cabeçalho
+  const celulasHeader = [];
+  const regexHeader = /<t[hd][^>]*>([\s\S]*?)<\/t[hd]>/gi;
+  let matchHeader;
+  while ((matchHeader = regexHeader.exec(linhas[0])) !== null) {
+    celulasHeader.push(matchHeader[1].replace(/<[^>]*>/g, '').trim());
+  }
+  const colunasDatas = celulasHeader.slice(3);
+
+  // Processa linhas de dados
+  linhas.slice(1).forEach((linha) => {
+    const celulas = [];
+    const regexCelulas = /<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi;
+    let match;
+    while ((match = regexCelulas.exec(linha)) !== null) {
+      const conteudo = match[1] 
+        ? String(match[1]).replace(/<[^>]*>/g, '').trim()
+        : '';
+      celulas.push(conteudo);
+    }
+
+    if (celulas.length >= 6) {
+      const produto = (celulas[0] || 'Não Informado').replace(/\s+/g, ' ').trim();
+      const regiao = (celulas[1] || 'Não Informada').replace(/\(.*?\)/g, '').replace(/\s+/g, ' ').trim();
+      const unidade = (celulas[2] || '').replace(/[^a-zA-Z0-9]/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+
+      colunasDatas.forEach((dataHeader, indexData) => {
+        const indiceColuna = 3 + indexData;
+        if (indiceColuna >= celulas.length) return;
+
+        const precoTexto = celulas[indiceColuna];
+        const preco = parseFloat(precoTexto.replace(/[^\d,]/g, '').replace(',', '.')) || 0;
+
+        if (preco > 0) {
+          let variacao = 0;
+          if (indexData > 0) {
+            const precoAnteriorTexto = celulas[indiceColuna - 1];
+            const precoAnterior = parseFloat(precoAnteriorTexto?.replace(/[^\d,]/g, '').replace(',', '.')) || 0;
+            variacao = precoAnterior > 0 
+              ? Number((((preco - precoAnterior) / precoAnterior) * 100).toFixed(2))
+              : 0;
+          }
+
+          dados.push({
+            dataColeta: new Date(),
+            produto: produto,
+            regiao: regiao,
+            unidade: unidade || 'un',
+            preco: preco,
+            dataPreco: normalizarData(dataHeader),
+            variacao: variacao,
+            status: definirStatus(variacao),
+            fonte: 'HF Brasil'
+          });
+        }
+      });
+    }
+  });
+
+  console.log(`📈 Registros extraídos: ${dados.length}`);
+  console.log('📋 Exemplo dos primeiros 3 registros:');
+  dados.slice(0, 3).forEach((item, i) => {
+    console.log(`${i+1}. ${item.produto} | ${item.regiao} | ${item.unidade} | ${item.dataPreco}: R$ ${item.preco}`);
+  });
+  return dados;
+}
+
+// ===================
+// NORMALIZAÇÃO E CHAVE ÚNICA
+// ===================
+function normalizarDataUniversal(dataStr) {
+  if (!dataStr) return '';
+  if (dataStr instanceof Date) {
+    return Utilities.formatDate(dataStr, Session.getScriptTimeZone(), "dd/MM/yyyy");
+  }
+  const meses = {
+    'jan': '01', 'fev': '02', 'mar': '03', 'abr': '04',
+    'mai': '05', 'jun': '06', 'jul': '07', 'ago': '08',
+    'set': '09', 'out': '10', 'nov': '11', 'dez': '12'
+  };
+  try {
+    const partes = dataStr.replace(/[^\d/]/g, '').split('/');
+    let dia = '01', mes = '01', ano = new Date().getFullYear();
+    if (partes.length >= 1) dia = partes[0].padStart(2, '0');
+    if (partes.length >= 2) mes = meses[partes[1].toLowerCase()] || partes[1].padStart(2, '0');
+    if (partes.length >= 3) ano = partes[2];
+    return `${dia}/${mes}/${ano}`;
+  } catch (e) {
+    console.error('Erro na normalização de data:', dataStr);
+    return '00/00/0000';
+  }
+}
+
+function criarChaveUnica(produto, regiao, unidade, dataPreco) {
+  const normalizar = (str) => String(str)
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, ' ').trim().toLowerCase();
+  const dataNormalizada = normalizarDataUniversal(dataPreco);
+  return [
+    normalizar(produto),
+    normalizar(regiao),
+    normalizar(unidade),
+    dataNormalizada
+  ].join('|');
+}
+
+// ===================
+// SALVAMENTO NA PLANILHA (SEM DUPLICIDADE)
+// ===================
+function salvarNaPlanilha(dadosNovos) {
+  const sheet = SpreadsheetApp.openById(CONFIG.SHEET_ID).getActiveSheet();
+  const dadosExistentes = sheet.getDataRange().getValues();
+  const indice = new Map();
+  for (let i = 1; i < dadosExistentes.length; i++) {
+    const linha = dadosExistentes[i];
+    let dataPreco = linha[5];
+    if (dataPreco instanceof Date) {
+      dataPreco = Utilities.formatDate(dataPreco, Session.getScriptTimeZone(), "dd/MM/yyyy");
+    }
+    const chave = criarChaveUnica(linha[1], linha[2], linha[3], dataPreco);
+    indice.set(chave, i);
+  }
+  const operacoes = { atualizados: 0, inseridos: 0 };
+  const zonaHoraria = Session.getScriptTimeZone();
+  dadosNovos.forEach(novo => {
+    const chave = criarChaveUnica(novo.produto, novo.regiao, novo.unidade, novo.dataPreco);
+    if (indice.has(chave)) {
+      const linha = indice.get(chave) + 1;
+      sheet.getRange(linha, 1, 1, 9).setValues([[
+        Utilities.formatDate(novo.dataColeta, zonaHoraria, "dd/MM/yyyy HH:mm:ss"),
+        novo.produto,
+        novo.regiao,
+        novo.unidade,
+        novo.preco,
+        novo.dataPreco,
+        novo.variacao,
+        novo.status,
+        novo.fonte
+      ]]);
+      operacoes.atualizados++;
+    } else {
+      sheet.appendRow([
+        Utilities.formatDate(novo.dataColeta, zonaHoraria, "dd/MM/yyyy HH:mm:ss"),
+        novo.produto,
+        novo.regiao,
+        novo.unidade,
+        novo.preco,
+        novo.dataPreco,
+        novo.variacao,
+        novo.status,
+        novo.fonte
+      ]);
+      operacoes.inseridos++;
+    }
+  });
+  console.log(`📊 Resultado: ${operacoes.atualizados} atualizados | ${operacoes.inseridos} novos`);
+}
+
+// ===================
+// STATUS E RELATÓRIO
+// ===================
+function definirStatus(variacao) {
+  if (variacao > 15) return 'Alta Significativa';
+  if (variacao > 5) return 'Em Alta';
+  if (variacao < -15) return 'Queda Significativa';
+  if (variacao < -5) return 'Em Queda';
+  return 'Estável';
+}
+
+function enviarRelatorio(dados) {
+  const resumo = gerarResumo(dados);
+  const alertas = identificarAlertas(dados);
+  const assunto = `Relatório HF Brasil - ${new Date().toLocaleDateString()}`;
+  const corpo = `
+    📊 RELATÓRIO DIÁRIO - HF BRASIL TOMATES
+
+    ✅ Dados coletados: ${dados.length} registros
+    ⏰ Horário: ${new Date().toLocaleString()}
+
+    📈 RESUMO POR PRODUTO:
+    ${resumo}
+
+    🚨 ALERTAS IMPORTANTES:
+    ${alertas.length > 0 ? alertas.join('\n') : 'Nenhum alerta crítico'}
+
+    📋 Acesse a planilha: https://docs.google.com/spreadsheets/d/${CONFIG.SHEET_ID}
+  `;
+  GmailApp.sendEmail(CONFIG.EMAIL_ALERTAS, assunto, corpo);
+}
+
+function gerarResumo(dados) {
+  const grupos = {};
+  dados.forEach(item => {
+    if (!grupos[item.produto]) grupos[item.produto] = [];
+    grupos[item.produto].push(item);
+  });
+  let resumo = '';
+  Object.keys(grupos).forEach(produto => {
+    const itens = grupos[produto];
+    const precoMedio = itens.reduce((sum, item) => sum + item.preco, 0) / itens.length;
+    const variacaoMedia = itens.reduce((sum, item) => sum + Math.abs(item.variacao), 0) / itens.length;
+    resumo += `• ${produto}: R$ ${precoMedio.toFixed(2)} (var. ${variacaoMedia.toFixed(1)}%)\n`;
+  });
+  return resumo;
+}
+
+function identificarAlertas(dados) {
+  const alertas = [];
+  dados.forEach(item => {
+    if (Math.abs(item.variacao) > 20) {
+      alertas.push(`🔥 ${item.produto} (${item.regiao}): ${item.variacao > 0 ? '+' : ''}${item.variacao}%`);
+    }
+  });
+  return alertas;
+}
+
+// ===================
+// MONITORAMENTO DE ESTRUTURA E BACKUP
+// ===================
+function verificarEstruturaSite() {
+  try {
+    const html = UrlFetchApp.fetch(CONFIG.URL_HF_BRASIL).getContentText();
+    const tabelaMatch = html.match(/<tbody[\s\S]*?<\/tbody>/i)?.[0] || '';
+    const htmlFiltrado = tabelaMatch
+      .replace(/class="[^"]*"/g, '')
+      .replace(/id="[^"]*"/g, '')
+      .replace(/\s+/g, ' ')
+      .replace(/<!--[\s\S]*?-->/g, '');
+    const hashAtual = Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, htmlFiltrado));
+    const hashAnterior = PropertiesService.getScriptProperties().getProperty('hashEstrutura');
+    if (hashAnterior && hashAnterior !== hashAtual) {
+      const dadosAtuais = buscarDadosHFBrasil(html);
+      const hashDadosAtuais = Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, JSON.stringify(dadosAtuais)));
+      const hashDadosAnterior = PropertiesService.getScriptProperties().getProperty('hashDados');
+      if (hashDadosAtuais !== hashDadosAnterior) {
+        enviarAlertaEstrutura(hashAnterior, hashAtual);
+      }
+      PropertiesService.getScriptProperties().setProperty('hashDados', hashDadosAtuais);
+    }
+    PropertiesService.getScriptProperties().setProperty('hashEstrutura', hashAtual);
+  } catch (error) {
+    console.error('Erro na verificação de estrutura:', error);
+  }
+}
+
+function enviarAlertaEstrutura(hashAnterior, hashAtual) {
+  const mensagem = `⚠️ ALERTA: Mudança relevante detectada!\n\n` +
+    `Hash anterior: ${hashAnterior}\n` +
+    `Hash atual: ${hashAtual}\n\n` +
+    `Data da última alteração: ${new Date().toLocaleString()}\n` +
+    `Verifique manualmente: ${CONFIG.URL_HF_BRASIL}`;
+  GmailApp.sendEmail(
+    CONFIG.EMAIL_ALERTAS,
+    'Mudança Estrutural Detectada - HF Brasil',
+    mensagem
+  );
+}
+
+function backupDiario() {
+  try {
+    const planilha = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+    const nomeArquivo = `Backup HF Brasil ${Utilities.formatDate(new Date(), 'GMT-3', 'dd-MM-yyyy HH:mm')}`;
+    DriveApp.createFile(nomeArquivo, planilha.getBlob());
+    console.log(`✅ Backup realizado: ${nomeArquivo}`);
+  } catch (error) {
+    console.error('❌ Erro no backup:', error);
+    enviarAlertaErro(`Falha no backup: ${error.message}`);
+  }
+}
+
+// ===================
+// UTILITÁRIOS E GATILHOS
+// ===================
+function enviarAlertaErro(mensagem) {
+  const mensagemCompleta = `${mensagem}\n\nEste alerta pode ser causado por:\n1. Alterações no layout do site\n2. Atualizações de anúncios/banners\n3. Pequenas mudanças não críticas\n\nVerifique sempre manualmente antes de tomar ações!`;
+  GmailApp.sendEmail(CONFIG.EMAIL_ALERTAS, 'Alerta do Crawler HF Brasil', mensagemCompleta);
+}
+
+function configurarGatilhoDiario() {
+  ScriptApp.getProjectTriggers().forEach(trigger => ScriptApp.deleteTrigger(trigger));
+  ScriptApp.newTrigger('crawlerHFBrasil').timeBased().everyDays(1).atHour(8).create();
+  ScriptApp.newTrigger('backupDiario').timeBased().everyDays(1).atHour(2).create();
+  console.log('⏰ Gatilhos configurados: Crawler (8h) e Backup (2h)');
+}
+
+function configurarSistemaCompleto() {
+  configurarGatilhoDiario();
+  verificarEstruturaSite(); // Estabelece hash inicial
+}
+
+function testarCrawler() {
+  console.log('🧪 TESTE DO CRAWLER HF BRASIL');
+  try {
+    crawlerHFBrasil();
+    console.log('✅ Teste concluído com sucesso!');
+  } catch (error) {
+    console.error('❌ Erro no teste:', error);
+  }
+}
