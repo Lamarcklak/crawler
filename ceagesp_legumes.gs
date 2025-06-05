@@ -30,8 +30,10 @@ function buscarDadosCeagesp() {
   try {
     // Usa filtro "LEGUMES" e data mais recente disponível
     const paginaInicial = UrlFetchApp.fetch(CONFIG_CEAGESP.URL_CEAGESP).getContentText();
-    const matchData = paginaInicial.match(/option value="(\d{2}\/\d{2}\/\d{4})"/);
-    const dataMaisRecente = matchData ? matchData[1] : Utilities.formatDate(new Date(), 'GMT-3', 'dd/MM/yyyy');
+    const matches = [...paginaInicial.matchAll(/value\s*=\s*"(\d{2}\/\d{2}\/\d{4})"/g)].map(m => m[1]);
+    const dataMaisRecente = matches.length > 0
+      ? matches[matches.length - 1]
+      : Utilities.formatDate(new Date(), 'GMT-3', 'dd/MM/yyyy');
     const options = {
       method: 'post',
       payload: {
@@ -90,7 +92,7 @@ function extrairDadosCeagesp(html) {
 }
 
 // ===================
-// NORMALIZAÇÃO E CHAVE Única
+// NORMALIZAÇÃO E CHAVE ÚNICA
 // ===================
 function normalizarDataUniversal(dataStr) {
   if (!dataStr) return '';
